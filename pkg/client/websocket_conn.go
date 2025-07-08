@@ -170,3 +170,10 @@ func getMessageBytes(data *Message) []byte {
 
 	return out
 }
+
+// Close - closes the underlying WebSocket connection
+func (conn *WebsocketConnection) Close() {
+	if conn.socket != nil && conn.socket.IsConnected {
+		conn.socket.Close()
+	}
+}

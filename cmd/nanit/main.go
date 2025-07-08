@@ -35,6 +35,12 @@ func main() {
 			// 300 second (5 min) default message timeout (unseen messages are ignored once they are this old)
 			MessageTimeout: utils.EnvVarSeconds("NANIT_EVENTS_MESSAGE_TIMEOUT", 300*time.Second),
 		},
+		WebSocketReset: app.WebSocketResetOpts{
+			// Reset behavior disabled by default
+			Enabled: utils.EnvVarBool("NANIT_MQTT_RESET_WHEN_FAILED", false),
+			// 500ms default timeout for command responses
+			CommandTimeout: utils.EnvVarSeconds("NANIT_WEBSOCKET_TIMEOUT", time.Second),
+		},
 	}
 
 	if utils.EnvVarBool("NANIT_RTMP_ENABLED", true) {

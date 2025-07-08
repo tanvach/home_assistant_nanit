@@ -14,6 +14,7 @@ type Opts struct {
 	MQTT             *mqtt.Opts
 	RTMP             *RTMPOpts
 	EventPolling     EventPollingOpts
+	WebSocketReset   WebSocketResetOpts
 }
 
 // NanitCredentials - user credentials for Nanit account
@@ -43,4 +44,13 @@ type EventPollingOpts struct {
 	Enabled         bool
 	PollingInterval time.Duration
 	MessageTimeout  time.Duration
+}
+
+// WebSocketResetOpts - options for WebSocket reset behavior
+type WebSocketResetOpts struct {
+	// Enable reset behavior when commands fail
+	Enabled bool
+	
+	// Timeout for command responses before marking as failed
+	CommandTimeout time.Duration
 }

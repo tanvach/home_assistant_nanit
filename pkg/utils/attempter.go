@@ -27,6 +27,9 @@ type PerseverenceOpts struct {
 
 	// RunnerID - optional string name for the runner for debugging purposes
 	RunnerID string
+	
+	// ShouldSkipCooldown - optional callback to determine if cooldown should be skipped
+	ShouldSkipCooldown func() bool
 }
 
 var lastPerseveranceRunnerID int32 = 0
@@ -77,7 +80,11 @@ func RunWithPerseverance(handler func(AttemptContext), ctx GracefulContext, opts
 				cooldown := opts.Cooldown[MinInt(try, len(opts.Cooldown))-1]
 				try++
 
-				if cooldown > timeTaken {
+				// Check if we should skip cooldown (e.g., for forced reconnections)
+				if opts.ShouldSkipCooldown != nil && opts.ShouldSkipCooldown() {
+					sublog.Trace().Msg("Skipping cooldown due to ShouldSkipCooldown callback")
+					timer.Reset(0)
+				} else if cooldown > timeTaken {
 					waitDur := cooldown - timeTaken
 					sublog.Trace().Str("cooldown", fmt.Sprintf("%v", cooldown)).Str("remaining", fmt.Sprintf("%v", waitDur)).Msg("Cooling down before the next attempt")
 					timer.Reset(waitDur)

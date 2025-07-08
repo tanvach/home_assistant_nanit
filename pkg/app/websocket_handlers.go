@@ -118,3 +118,145 @@ func sendStandbyCommand(standbyState bool, conn *client.WebsocketConnection) {
 		},
 	})
 }
+// sendLightCommandWithReset - sends light command with reset logic if enabled
+func (app *App) sendLightCommandWithReset(babyUID string, enabled bool, conn *client.WebsocketConnection) bool {
+	if !app.Opts.WebSocketReset.Enabled {
+		// If reset is disabled, use the original function
+		sendLightCommand(enabled, conn)
+		return true
+	}
+
+	// Try to send the command with timeout
+	success := app.sendLightCommandWithTimeout(babyUID, enabled, conn)
+	
+	if !success && app.shouldAttemptReset(babyUID) {
+		log.Warn().
+			Str("baby_uid", babyUID).
+			Bool("enabled", enabled).
+			Msg("Light command failed, attempting WebSocket reset")
+		
+		// Add command to pending retries
+		app.addPendingRetry(babyUID, "light", enabled)
+		
+		// Force reconnection
+		manager := app.getBabyManager(babyUID)
+		if manager != nil {
+			manager.ForceReconnect()
+		}
+		
+		return false
+	}
+	
+	return success
+}
+
+// sendStandbyCommandWithReset - sends standby command with reset logic if enabled
+func (app *App) sendStandbyCommandWithReset(babyUID string, enabled bool, conn *client.WebsocketConnection) bool {
+	if !app.Opts.WebSocketReset.Enabled {
+		// If reset is disabled, use the original function
+		sendStandbyCommand(enabled, conn)
+		return true
+	}
+
+	// Try to send the command with timeout
+	success := app.sendStandbyCommandWithTimeout(babyUID, enabled, conn)
+	
+	if !success && app.shouldAttemptReset(babyUID) {
+		log.Warn().
+			Str("baby_uid", babyUID).
+			Bool("enabled", enabled).
+			Msg("Standby command failed, attempting WebSocket reset")
+		
+		// Add command to pending retries
+		app.addPendingRetry(babyUID, "standby", enabled)
+		
+		// Force reconnection
+		manager := app.getBabyManager(babyUID)
+		if manager != nil {
+			manager.ForceReconnect()
+		}
+		
+		return false
+	}
+	
+	return success
+}
+
+// sendLightCommandWithTimeout - sends light command with timeout checking
+func (app *App) sendLightCommandWithTimeout(babyUID string, enabled bool, conn *client.WebsocketConnection) bool {
+	nightLight := client.Control_LIGHT_OFF
+	if enabled {
+		nightLight = client.Control_LIGHT_ON
+	}
+	
+	awaitResponse := conn.SendRequest(client.RequestType_PUT_CONTROL, &client.Request{
+		Control: &client.Control{
+			NightLight: &nightLight,
+		},
+	})
+	
+	// Wait for camera response with configured timeout
+	response, err := awaitResponse(app.Opts.WebSocketReset.CommandTimeout)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("baby_uid", babyUID).
+			Bool("enabled", enabled).
+			Dur("timeout", app.Opts.WebSocketReset.CommandTimeout).
+			Msg("Failed to send light command within timeout")
+		return false
+	}
+	
+	if response.StatusCode != nil && *response.StatusCode != 200 {
+		log.Warn().
+			Int32("status_code", *response.StatusCode).
+			Str("status_message", response.GetStatusMessage()).
+			Str("baby_uid", babyUID).
+			Bool("enabled", enabled).
+			Msg("Light command failed with error status")
+		return false
+	}
+	
+	log.Debug().
+		Str("baby_uid", babyUID).
+		Bool("enabled", enabled).
+		Msg("Light command sent successfully")
+	return true
+}
+
+// sendStandbyCommandWithTimeout - sends standby command with timeout checking
+func (app *App) sendStandbyCommandWithTimeout(babyUID string, enabled bool, conn *client.WebsocketConnection) bool {
+	awaitResponse := conn.SendRequest(client.RequestType_PUT_SETTINGS, &client.Request{
+		Settings: &client.Settings{
+			SleepMode: &enabled,
+		},
+	})
+	
+	// Wait for camera response with configured timeout
+	response, err := awaitResponse(app.Opts.WebSocketReset.CommandTimeout)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("baby_uid", babyUID).
+			Bool("enabled", enabled).
+			Dur("timeout", app.Opts.WebSocketReset.CommandTimeout).
+			Msg("Failed to send standby command within timeout")
+		return false
+	}
+	
+	if response.StatusCode != nil && *response.StatusCode != 200 {
+		log.Warn().
+			Int32("status_code", *response.StatusCode).
+			Str("status_message", response.GetStatusMessage()).
+			Str("baby_uid", babyUID).
+			Bool("enabled", enabled).
+			Msg("Standby command failed with error status")
+		return false
+	}
+	
+	log.Debug().
+		Str("baby_uid", babyUID).
+		Bool("enabled", enabled).
+		Msg("Standby command sent successfully")
+	return true
+}

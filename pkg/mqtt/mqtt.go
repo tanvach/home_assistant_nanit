@@ -11,8 +11,8 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type SendLightCommandHandler func(nightLightState bool)
-type SendStandbyCommandHandler func(standbyState bool)
+type SendLightCommandHandler func(babyUID string, nightLightState bool)
+type SendStandbyCommandHandler func(babyUID string, standbyState bool)
 
 // Connection - MQTT context
 type Connection struct {
@@ -90,7 +90,7 @@ func (conn *Connection) subscribeToLightCommand() {
 				Str("payload", string(msg.Payload())).
 				Msg("Received light command")
 
-			conn.sendLightCommandHandler(enabled)
+			conn.sendLightCommandHandler(babyUID, enabled)
 		default:
 			log.Warn().Str("command", command).Msg("Unknown command received")
 		}
@@ -135,7 +135,7 @@ func (conn *Connection) subscribeToStandbyCommand() {
 				Str("payload", string(msg.Payload())).
 				Msg("Received standby command")
 
-			conn.sendStandbyCommandHandler(enabled)
+			conn.sendStandbyCommandHandler(babyUID, enabled)
 		default:
 			log.Warn().Str("command", command).Msg("Unknown command received")
 		}

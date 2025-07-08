@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
@@ -12,6 +13,7 @@ import (
 	"github.com/indiefan/home_assistant_nanit/pkg/rtmpserver"
 	"github.com/indiefan/home_assistant_nanit/pkg/session"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
+	"github.com/rs/zerolog/log"
 )
 
 // App - application container
@@ -21,6 +23,26 @@ type App struct {
 	BabyStateManager *baby.StateManager
 	RestClient       *client.NanitClient
 	MQTTConnection   *mqtt.Connection
+	
+	// Connection registry for routing MQTT commands to the correct baby
+	babyConnections map[string]*client.WebsocketConnection
+	connectionsMutex sync.RWMutex
+	
+	// WebSocket manager registry for forced reconnection
+	babyManagers     map[string]*client.WebsocketConnectionManager
+	managersMutex    sync.RWMutex
+	
+	// Command retry tracking
+	pendingRetries   map[string]*commandRetry
+	retriesMutex     sync.RWMutex
+}
+
+// commandRetry - tracks a command that needs to be retried after reconnection
+type commandRetry struct {
+	CommandType string // "light" or "standby"
+	BabyUID     string
+	Enabled     bool
+	Timestamp   time.Time
 }
 
 // NewApp - constructor
@@ -37,6 +59,9 @@ func NewApp(opts Opts) *App {
 			RefreshToken: opts.NanitCredentials.RefreshToken,
 			SessionStore: sessionStore,
 		},
+		babyConnections: make(map[string]*client.WebsocketConnection),
+		babyManagers:     make(map[string]*client.WebsocketConnectionManager),
+		pendingRetries:   make(map[string]*commandRetry),
 	}
 
 	if opts.MQTT != nil {
@@ -44,6 +69,127 @@ func NewApp(opts Opts) *App {
 	}
 
 	return instance
+}
+
+// registerBabyConnection - registers a websocket connection for a specific baby
+func (app *App) registerBabyConnection(babyUID string, conn *client.WebsocketConnection) {
+	app.connectionsMutex.Lock()
+	defer app.connectionsMutex.Unlock()
+	app.babyConnections[babyUID] = conn
+	log.Debug().Str("baby_uid", babyUID).Msg("Registered baby connection")
+}
+
+// unregisterBabyConnection - removes a websocket connection for a specific baby
+func (app *App) unregisterBabyConnection(babyUID string) {
+	app.connectionsMutex.Lock()
+	defer app.connectionsMutex.Unlock()
+	delete(app.babyConnections, babyUID)
+	log.Debug().Str("baby_uid", babyUID).Msg("Unregistered baby connection")
+}
+
+// getBabyConnection - retrieves the websocket connection for a specific baby
+func (app *App) getBabyConnection(babyUID string) *client.WebsocketConnection {
+	app.connectionsMutex.RLock()
+	defer app.connectionsMutex.RUnlock()
+	return app.babyConnections[babyUID]
+}
+
+// registerBabyManager - registers a websocket manager for a specific baby
+func (app *App) registerBabyManager(babyUID string, manager *client.WebsocketConnectionManager) {
+	app.managersMutex.Lock()
+	defer app.managersMutex.Unlock()
+	app.babyManagers[babyUID] = manager
+	log.Debug().Str("baby_uid", babyUID).Msg("Registered baby WebSocket manager")
+}
+
+// unregisterBabyManager - removes a websocket manager for a specific baby
+func (app *App) unregisterBabyManager(babyUID string) {
+	app.managersMutex.Lock()
+	defer app.managersMutex.Unlock()
+	delete(app.babyManagers, babyUID)
+	log.Debug().Str("baby_uid", babyUID).Msg("Unregistered baby WebSocket manager")
+}
+
+// getBabyManager - retrieves the websocket manager for a specific baby
+func (app *App) getBabyManager(babyUID string) *client.WebsocketConnectionManager {
+	app.managersMutex.RLock()
+	defer app.managersMutex.RUnlock()
+	return app.babyManagers[babyUID]
+}
+
+// shouldAttemptReset - checks if reset behavior is enabled
+func (app *App) shouldAttemptReset(babyUID string) bool {
+	if !app.Opts.WebSocketReset.Enabled {
+		return false
+	}
+	
+	log.Info().
+		Str("baby_uid", babyUID).
+		Msg("Reset is enabled - allowing reset")
+	return true
+}
+
+// addPendingRetry - adds a command to be retried after reconnection
+func (app *App) addPendingRetry(babyUID string, commandType string, enabled bool) {
+	app.retriesMutex.Lock()
+	defer app.retriesMutex.Unlock()
+	
+	retryKey := fmt.Sprintf("%s_%s", babyUID, commandType)
+	app.pendingRetries[retryKey] = &commandRetry{
+		CommandType: commandType,
+		BabyUID:     babyUID,
+		Enabled:     enabled,
+		Timestamp:   time.Now(),
+	}
+	
+	log.Debug().
+		Str("baby_uid", babyUID).
+		Str("command_type", commandType).
+		Bool("enabled", enabled).
+		Msg("Added pending retry command")
+}
+
+// processPendingRetries - processes any pending retry commands for a baby
+func (app *App) processPendingRetries(babyUID string) {
+	app.retriesMutex.Lock()
+	
+	var retries []*commandRetry
+	keysToDelete := make([]string, 0)
+	
+	for key, retry := range app.pendingRetries {
+		if retry.BabyUID == babyUID {
+			retries = append(retries, retry)
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	
+	// Remove processed retries
+	for _, key := range keysToDelete {
+		delete(app.pendingRetries, key)
+	}
+	
+	app.retriesMutex.Unlock()
+	
+	// Execute retries
+	for _, retry := range retries {
+		conn := app.getBabyConnection(babyUID)
+		if conn != nil {
+			log.Info().
+				Str("baby_uid", babyUID).
+				Str("command_type", retry.CommandType).
+				Bool("enabled", retry.Enabled).
+				Msg("Retrying command after reconnection")
+			
+			switch retry.CommandType {
+			case "light":
+				// Send command directly without retry logic to avoid infinite loops
+				sendLightCommand(retry.Enabled, conn)
+			case "standby":
+				// Send command directly without retry logic to avoid infinite loops
+				sendStandbyCommand(retry.Enabled, conn)
+			}
+		}
+	}
 }
 
 // Run - application main loop
@@ -59,8 +205,35 @@ func (app *App) Run(ctx utils.GracefulContext) {
 		go rtmpserver.StartRTMPServer(app.Opts.RTMP.ListenAddr, app.BabyStateManager)
 	}
 
-	// MQTT
+	// MQTT - Register global command handlers
 	if app.MQTTConnection != nil {
+		// Register handlers that route commands to the correct baby
+		app.MQTTConnection.RegisterLightHandler(func(babyUID string, enabled bool) {
+			conn := app.getBabyConnection(babyUID)
+			if conn != nil {
+				log.Debug().Str("baby_uid", babyUID).Bool("enabled", enabled).Msg("Routing light command to baby")
+				success := app.sendLightCommandWithReset(babyUID, enabled, conn)
+				if !success {
+					log.Warn().Str("baby_uid", babyUID).Bool("enabled", enabled).Msg("Light command failed after reset attempt")
+				}
+			} else {
+				log.Warn().Str("baby_uid", babyUID).Msg("No connection found for baby, cannot send light command")
+			}
+		})
+		
+		app.MQTTConnection.RegisterStandyHandler(func(babyUID string, enabled bool) {
+			conn := app.getBabyConnection(babyUID)
+			if conn != nil {
+				log.Debug().Str("baby_uid", babyUID).Bool("enabled", enabled).Msg("Routing standby command to baby")
+				success := app.sendStandbyCommandWithReset(babyUID, enabled, conn)
+				if !success {
+					log.Warn().Str("baby_uid", babyUID).Bool("enabled", enabled).Msg("Standby command failed after reset attempt")
+				}
+			} else {
+				log.Warn().Str("baby_uid", babyUID).Msg("No connection found for baby, cannot send standby command")
+			}
+		})
+		
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
 			app.MQTTConnection.Run(app.BabyStateManager, childCtx)
 		})
@@ -86,6 +259,9 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 	if app.Opts.RTMP != nil || app.MQTTConnection != nil {
 		// Websocket connection
 		ws := client.NewWebsocketConnectionManager(baby.UID, baby.CameraUID, app.SessionStore.Session, app.RestClient, app.BabyStateManager)
+		
+		// Register the WebSocket manager for forced reconnection
+		app.registerBabyManager(baby.UID, ws)
 
 		ws.WithReadyConnection(func(conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
 			app.runWebsocket(baby.UID, conn, childCtx)
@@ -100,7 +276,11 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 		})
 	}
 
+	// Wait for context to complete
 	<-ctx.Done()
+	
+	// Clean up when context is done
+	app.unregisterBabyManager(baby.UID)
 }
 
 func (app *App) pollMessages(babyUID string, babyStateManager *baby.StateManager) {
@@ -123,6 +303,12 @@ func (app *App) pollMessages(babyUID string, babyStateManager *baby.StateManager
 }
 
 func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
+	// Register this connection in the connection registry
+	app.registerBabyConnection(babyUID, conn)
+	
+	// Process any pending retry commands after reconnection
+	app.processPendingRetries(babyUID)
+	
 	// Reading sensor data
 	conn.RegisterMessageHandler(func(m *client.Message, conn *client.WebsocketConnection) {
 		// Sensor request initiated by us on start (or some other client, we don't care)
@@ -149,14 +335,6 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 		}
 	})
 
-	if app.Opts.MQTT != nil && app.MQTTConnection != nil {
-		app.MQTTConnection.RegisterLightHandler(func(enabled bool) {
-			sendLightCommand(enabled, conn)
-		})
-		app.MQTTConnection.RegisterStandyHandler(func(enabled bool) {
-			sendStandbyCommand(enabled, conn)
-		})
-	}
 
 	// Get the initial state of the light
 	conn.SendRequest(client.RequestType_GET_CONTROL, &client.Request{GetControl_: &client.GetControl{
@@ -224,6 +402,10 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 	}
 
 	<-childCtx.Done()
+	
+	// Unregister this connection from the connection registry
+	app.unregisterBabyConnection(babyUID)
+	
 	if cleanup != nil {
 		cleanup()
 	}

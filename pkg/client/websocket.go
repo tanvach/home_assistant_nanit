@@ -33,6 +33,9 @@ type WebsocketConnectionManager struct {
 	mu               sync.RWMutex
 	readyState       *readyState
 	readySubscribers []WebsocketConnectionHandler
+	forceReconnect   chan struct{}
+	forcedReconnect  bool
+	forcedMutex      sync.RWMutex
 }
 
 // NewWebsocketConnectionManager - constructor
@@ -43,6 +46,7 @@ func NewWebsocketConnectionManager(babyUID string, cameraUID string, session *se
 		Session:          session,
 		API:              api,
 		BabyStateManager: babyStateManager,
+		forceReconnect:   make(chan struct{}, 1),
 	}
 
 	manager.WithReadyConnection(func(conn *WebsocketConnection, ctx utils.GracefulContext) {
@@ -89,10 +93,28 @@ func (manager *WebsocketConnectionManager) RunWithinContext(ctx utils.GracefulCo
 			15 * time.Minute,
 			1 * time.Hour,
 		},
+		// Check if this is a forced reconnection to bypass cooldown
+		ShouldSkipCooldown: func() bool {
+			manager.forcedMutex.RLock()
+			defer manager.forcedMutex.RUnlock()
+			return manager.forcedReconnect
+		},
 	})
 }
 
 func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
+	// Check if this is a forced reconnection
+	manager.forcedMutex.Lock()
+	wasForcedReconnect := manager.forcedReconnect
+	if manager.forcedReconnect {
+		manager.forcedReconnect = false // Reset the flag
+	}
+	manager.forcedMutex.Unlock()
+
+	if wasForcedReconnect {
+		log.Info().Str("baby_uid", manager.BabyUID).Msg("Performing forced reconnection (bypassing cooldown)")
+	}
+
 	// Reauthorize if it is not a first try or we assume we don't have a valid token
 	manager.API.MaybeAuthorize(attempt.GetTry() > 1)
 
@@ -113,7 +135,11 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 
 	// Handle new connection
 	socket.OnConnected = func(socket gowebsocket.Socket) {
-		log.Info().Str("url", url).Msg("Connected to websocket")
+		log.Info().
+			Str("url", url).
+			Str("baby_uid", manager.BabyUID).
+			Bool("was_forced_reconnect", wasForcedReconnect).
+			Msg("Connected to websocket")
 
 		go func() {
 			conn := NewWebsocketConnection(&socket)
@@ -137,7 +163,11 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 
 	// Handle failed attempts for connection
 	socket.OnConnectError = func(err error, socket gowebsocket.Socket) {
-		log.Error().Str("url", url).Err(err).Msg("Unable to establish websocket connection")
+		log.Error().
+			Str("url", url).
+			Str("baby_uid", manager.BabyUID).
+			Err(err).
+			Msg("Unable to establish websocket connection")
 		attempt.Fail(err)
 	}
 
@@ -147,10 +177,15 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 			manager.BabyStateManager.Update(manager.BabyUID, *baby.NewState().SetWebsocketAlive(false))
 
 			if err != nil {
-				log.Error().Err(err).Msg("Disconnected from server")
+				log.Error().
+					Str("baby_uid", manager.BabyUID).
+					Err(err).
+					Msg("Disconnected from server")
 				attempt.Fail(err)
 			} else {
-				log.Warn().Msg("Disconnected from server")
+				log.Warn().
+					Str("baby_uid", manager.BabyUID).
+					Msg("Disconnected from server")
 				attempt.Fail(errors.New("Server closed the connection"))
 			}
 		})
@@ -188,4 +223,22 @@ func notifyReadyHandler(handler WebsocketConnectionHandler, state readyState) {
 	state.Context.RunAsChild(func(childCtx utils.GracefulContext) {
 		handler(state.Connection, childCtx)
 	})
+}
+
+// ForceReconnect - forces a reconnection by closing the current connection
+func (manager *WebsocketConnectionManager) ForceReconnect() {
+	manager.mu.RLock()
+	readyState := manager.readyState
+	manager.mu.RUnlock()
+
+	if readyState != nil && readyState.Connection != nil {
+		log.Info().Str("baby_uid", manager.BabyUID).Msg("Forcing WebSocket reconnection")
+		
+		// Set the forced reconnection flag
+		manager.forcedMutex.Lock()
+		manager.forcedReconnect = true
+		manager.forcedMutex.Unlock()
+		
+		readyState.Connection.Close()
+	}
 }
